@@ -8,10 +8,12 @@
 5. 민석님에게 "지난 세션에서 EDA 완료 + `03_features.ipynb` 전체(1~11절, 결측/curtailment 처리·SCADA 회귀 풍속·밀도보정·시간/방향/앙상블차이/결빙/돌풍성 피처) 작성 완료했고, 다음은 민석님이 노트북을 실행해 확인하는 것입니다" 정도로 3줄 이내 보고 후 시작
 
 ## 현재 위치
-- 로드맵 단계: 6. 피처 엔지니어링 (1차 완료, `wind-domain-features` 스킬) → 다음은 7. 모델 선택(`model-selection` 스킬, `04_model_selection.ipynb` 신규 생성)
-- 작업 중 파일: `notebooks/03_features.ipynb` (**58개 셀**, 1~11절 전부) — 코드 작성 완료, **아직 민석님이 직접 실행 안 함** (AI가 별도 스크립트로 로직·통계적 유의성까지 전부 검증함 — 아래 환경 메모 참고)
-- `reports/03_features.md` **작성 완료** (Why/How/Result/So-what, AI가 검증한 수치 기준 — 민석님이 실제로 노트북을 실행해 같은 수치가 나오는지 확인 필요)
+- 로드맵 단계: 6. 피처 엔지니어링 **완료** (`wind-domain-features` 스킬) → 다음은 7. 모델 선택(`model-selection` 스킬, `04_model_selection.ipynb` 신규 생성)
+- 작업 중 파일: `notebooks/03_features.ipynb` (**58개 셀**, 1~11절 전부) — **민석님이 직접 실행 완료, 에러 0건, 모든 수치가 AI 사전 검증값과 정확히 일치 확인됨**(연도별 상관, out-of-sample 검증, 회귀계수 표, 결빙 위험 검증 표 전부 일치)
+- `reports/03_features.md` **작성 완료, 수치 검증 완료**
+- `train_features_v1.parquet`(26304,855)/`test_features_v1.parquet`(8760,845) 최종 저장 확인됨
 - EDA(`02_eda.ipynb` 1~6절)는 완료 상태 유지, `reports/02_eda.md`도 완료
+- (참고) 여러 셀에서 `PerformanceWarning: DataFrame is highly fragmented` 경고가 뜨지만 에러 아님 — 컬럼을 하나씩 추가해서 생기는 성능 힌트일 뿐, 이 데이터 규모에서는 무시해도 됨. 나중에 여유 있으면 `pd.concat`으로 한번에 합치는 방식으로 정리 가능(우선순위 낮음)
 
 ## 지난 세션(들)에서 한 것 — 누적 요약
 - `01_preprocessing.ipynb`: GFS/LDAPS pivot, SCADA 10분→1시간 집계, train_base/test_base parquet 캐시 생성 (완료, `reports/01_preprocessing.md`)
@@ -31,10 +33,9 @@
 
 ## 다음 할 일 (우선순위순)
 0. **민석님 답변 대기 중**: "`requirements.txt`를 지금 만들지, 나중에 한꺼번에 정리할지" AI가 질문했고 아직 답을 못 들음
-1. **민석님이 `03_features.ipynb`를 위에서부터 직접 실행**하고, 3-2/3-2b(회귀 검증 수치)·10절 검증 셀(결빙 위험이 SCADA 구간 통제 시 실제로 발전량을 낮추는지)이 `reports/03_features.md`에 적힌 값과 비슷하게 나오는지 확인
-2. `04_model_selection.ipynb` 신규 생성 — `model-selection` 스킬 참고, 후보 모델(Ridge/LightGBM/XGBoost/CatBoost 등) 공정 비교
-3. **`04_model_selection.ipynb`를 시작하면 가장 먼저 확인할 것**: 3절 회귀추정풍속(`ws_est`)의 fold-purity 캐벗 — A안/B안 검증 점수에서 이 피처가 `03_features.ipynb` 3-2의 out-of-sample 수치(0.85~0.87 근처)와 비슷하게 유지되는지 재확인. 떨어지면 fold별 재학습으로 바꿔야 함
-4. `train_features_v1.parquet`에서 모델 입력 피처 목록을 고를 때 `scada_ws_kpx_group_*`, `scada_kpx_group_*`, `year` 컬럼 반드시 제외(아래 참고)
+1. `04_model_selection.ipynb` 신규 생성 — `model-selection` 스킬 참고, 후보 모델(Ridge/LightGBM/XGBoost/CatBoost 등) 공정 비교
+2. **`04_model_selection.ipynb`를 시작하면 가장 먼저 확인할 것**: 3절 회귀추정풍속(`ws_est`)의 fold-purity 캐벗 — A안/B안 검증 점수에서 이 피처가 `03_features.ipynb` 3-2의 out-of-sample 수치(0.85~0.87 근처)와 비슷하게 유지되는지 재확인. 떨어지면 fold별 재학습으로 바꿔야 함
+3. `train_features_v1.parquet`에서 모델 입력 피처 목록을 고를 때 `scada_ws_kpx_group_*`, `scada_kpx_group_*`, `year` 컬럼 반드시 제외(아래 참고)
 
 ## 결정 사항 / 근거 (누적)
 
@@ -105,5 +106,5 @@
 ## 환경 메모
 - **scipy를 venv에 새로 설치함**(`03_features.ipynb` 2-1/3-2b의 Steiger's Z 검정에 실제로 씀). **이 프로젝트에는 아직 `requirements.txt`가 없음** — 재현성(2차 평가 요건)을 위해 조만간 만들어야 함(민석님 답변 대기 중, 위 "다음 할 일" 0번)
 - `02_eda.ipynb`/`reports/02_eda.md`는 이미 커밋됨(`2b9ce0a`). **아직 커밋 안 된 것**: `notebooks/03_features.ipynb`(신규), `reports/03_features.md`(신규), `HANDOFF.md`(수정) — 이번 세션 종료 시 커밋 제안함
-- **`03_features.ipynb`는 AI가 코드 검증 목적으로 별도 스크립트를 통해 전체 로직을 이미 실행해봤고(버그 없음 확인), 그 과정에서 `data/processed/train_features_v1.parquet`/`test_features_v1.parquet`가 이미 생성돼 있다.** 민석님이 노트북을 직접 실행하면 같은 내용으로 덮어써지므로 문제는 없지만, "내가 실행 안 했는데 왜 파일이 있지?" 하고 혼동하지 않도록 기록해둔다. `reports/03_features.md`도 같은 이유로 AI가 검증한 수치 기준으로 이미 작성돼 있다 — 민석님이 실행해서 다른 값이 나오면 반드시 알려줄 것.
+- **`03_features.ipynb`는 민석님이 직접 실행 완료함(에러 0건, AI 사전 검증 수치와 완전히 일치).** `data/processed/train_features_v1.parquet`/`test_features_v1.parquet`도 민석님 실행으로 최종 확정됨. `reports/03_features.md`의 수치도 검증 완료 상태.
 - `02_eda.ipynb`는 파일이 커서(122셀) 도구로 편집할 때 위 "버그·주의사항 2번" 방식을 써야 한다.
