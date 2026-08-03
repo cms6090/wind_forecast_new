@@ -337,40 +337,148 @@ def build_frame_given_pc(ctx, df, g, ws_series, edges, vals, tag, dynamics=True,
 # ---------------------------------------------------------------------------
 # 풍속 모델 (16절)
 # ---------------------------------------------------------------------------
-def build_wind_input_frame(ctx, df, g):
-    """풍속 모델의 입력. 라벨/SCADA에서 파생된 컬럼은 전부 제외한다."""
+def build_wind_input_frame(ctx, df, g, extra=None):
+    """풍속 모델의 입력. 라벨/SCADA에서 파생된 컬럼은 전부 제외한다.
+
+    `extra`: df.index에 정렬된 추가 피처 DataFrame (예: 지형 speed-up). None이면
+    기존 동작과 **완전히 동일**하다 — 05 1절 이식 검증 결과가 그대로 유효하다."""
     base = [c for c in ctx.group_cols[g] if not any(m in c for m in WIND_EXCLUDE_MARKERS)]
     dyn_src = [c for c in [f"{g}_ws10_nearest", "ldaps_ws10_avg16", "gfs_g5_ws_100m"] if c in df.columns]
-    out = pd.concat([df[ctx.common_cols + base], add_forecast_dynamics(df, dyn_src),
-                     add_lead_features(df)], axis=1)
+    parts = [df[ctx.common_cols + base], add_forecast_dynamics(df, dyn_src), add_lead_features(df)]
+    if extra is not None:
+        parts.append(extra)
+    out = pd.concat(parts, axis=1)
     bad = [c for c in out.columns if any(m in c for m in LABEL_DERIVED_MARKERS)]
     assert not bad, f"풍속 모델 입력에 라벨 의존 컬럼 잔존: {bad[:5]}"
     assert out.isna().sum().sum() == 0, "풍속 모델 입력에 결측"
     return out
 
 
-def fit_wind_gbdt(ctx, g, train_mask, objective="l2", n_estimators=3000, seed=SEED):
+# ---------------------------------------------------------------------------
+# 지형 speed-up — 풍향에 따라 달라지는 배율 (05 2-2절 진단 → 3절)
+# ---------------------------------------------------------------------------
+# 왜: 가덕산은 능선이고, 능선 위 기류는 압축돼 가속된다(Jackson–Hunt). 그 가속량은
+#     능선에 대한 바람의 각도에 따라 달라지는데, 수 km 해상도 예보 격자는 능선 지형을
+#     담지 못한다. 05 2-2a에서 speedup(실측÷10m예보) 중앙값이 풍향에 따라 1.00~1.62로
+#     움직이는 것을 확인했다(group_1 진폭 0.623, 표본 최다 구간 240°에서 극값).
+# 어떻게: 구간 더미를 만들지 않는다(04의 교훈 — regime_* 더미는 전부 gain 0.000%였다).
+#     **푸리에 기저로 매끄럽게 적합한 연속 배율**을 준다. 이산화는 모델에 맡긴다.
+SPEEDUP_HARMONICS = 3        # 360도 주기의 사인/코사인 3차까지 (구간 12개보다 적은 파라미터 7개)
+SPEEDUP_WS_FLOOR = 2.0       # 약풍은 비율이 폭발하므로 적합에서 제외 (05 2-2a와 동일 기준)
+SPEEDUP_CLIP = (0.3, 4.0)    # 비율 이상치 절단
+
+
+def _wd_design(wd_deg, n_harm=SPEEDUP_HARMONICS):
+    """풍향(도) → 푸리에 설계행렬 [1, cos θ, sin θ, cos 2θ, sin 2θ, ...].
+    풍향은 0도와 360도가 같은 방향이므로 **주기 함수여야** 한다 (다항식은 안 됨)."""
+    th = np.deg2rad(np.asarray(wd_deg, dtype=float))
+    cols = [np.ones_like(th)]
+    for k in range(1, n_harm + 1):
+        cols += [np.cos(k * th), np.sin(k * th)]
+    return np.column_stack(cols)
+
+
+def fit_speedup_curve(ctx, g, train_mask, n_harm=SPEEDUP_HARMONICS):
+    """speedup = SCADA실측 ÷ 10m예보 를 풍향의 매끄러운 함수로 적합한다.
+
+    ⚠️ **fold-safe**: `train_mask` 구간의 SCADA만 본다. 검증 구간 실측을 쓰면 즉시 누수다.
+    log를 취해 적합하는 이유: speedup은 곱셈 배율이라 log 공간에서 대칭이고,
+    log의 평균 = 기하평균이라 비율 데이터의 중앙값에 가깝다(산술평균보다 이상치에 강하다)."""
+    obs, fc, wd = ctx.train[f"scada_ws_{g}"], ctx.train[f"{g}_ws10_nearest"], ctx.train[f"{g}_wd"]
+    ok = train_mask & obs.notna() & (fc > SPEEDUP_WS_FLOOR) & wd.notna()
+    assert ok.sum() >= 500, f"{g}: speedup 적합 표본 부족 ({ok.sum()})"
+    ratio = (obs[ok] / fc[ok]).clip(*SPEEDUP_CLIP)
+    beta, *_ = np.linalg.lstsq(_wd_design(wd[ok], n_harm), np.log(ratio.to_numpy()), rcond=None)
+    return beta
+
+
+def apply_speedup_curve(beta, wd_deg, n_harm=SPEEDUP_HARMONICS):
+    """적합된 계수를 풍향에 적용 → 배율(양수). 라벨을 보지 않으므로 test에도 그대로 쓴다."""
+    return np.exp(_wd_design(wd_deg, n_harm) @ beta)
+
+
+def speedup_features(ctx, df, g, beta):
+    """지형 speed-up 피처 2개.
+
+    · `__terrain_speedup`   : 풍향만으로 정해지는 배율 자체
+    · `__ws10_terrain`      : 10m 예보풍속 × 배율 = **지형 보정된 풍속**
+      (모델이 곱셈 상호작용을 직접 만들기 어려우므로 곱한 값을 명시적으로 준다)"""
+    sp = apply_speedup_curve(beta, df[f"{g}_wd"].to_numpy(dtype=float))
+    return pd.DataFrame({f"{g}__terrain_speedup": sp,
+                         f"{g}__ws10_terrain": df[f"{g}_ws10_nearest"].to_numpy(dtype=float) * sp},
+                        index=df.index)
+
+
+def wind_extra_for_fold(ctx, df, g, train_mask, speedup=False):
+    """풍속 모델에 덧붙일 추가 피처. 지금은 speed-up 하나뿐이고, 끄면 None(=기존 동작)."""
+    if not speedup:
+        return None
+    return speedup_features(ctx, df, g, fit_speedup_curve(ctx, g, train_mask))
+
+
+#: 풍속 모델 표본가중의 세 가지 저울.
+#:   "slope" = |dP/dv|          — 발전량 민감도. 05 3-f에서 **기각**(-0.0098)
+#:   "rev"   = P                — FICR의 저울 그대로(수익 = actual 가중)
+#:   "pcrev" = |dP/dv| × P      — 민감도 × 수익
+#: 3-f가 실패한 이유: |dP/dv|는 민감도인데 FICR의 가중치는 `actual`이다. 그래서 수익이
+#: 가장 많은 구간(이용률 80~90%, 수익비중 16.8%, 밴드 적중률 0.485로 최고)을 가중 0.27로
+#: 눌러버렸다. "rev"/"pcrev"는 그 저울을 FICR 쪽으로 되돌린다.
+WWEIGHT_MODES = (None, "slope", "rev", "pcrev", "pcslope")   # "pcslope"는 "slope"의 옛 이름(3-f 셀 호환)
+
+
+def powercurve_slope_weight(ctx, g, train_mask, floor=0.05, mode="slope"):
+    """파워커브 기반 표본가중 — 발전량이 풍속에 **민감한 구간**을 더 정확히 맞추게 한다.
+
+    왜: 지금 풍속 모델은 `l2`로 모든 풍속 구간을 동등하게 학습한다. 그런데
+      · 6 m/s에서 0.5 m/s 오차 → 발전량 오차 큼 (파워커브 급경사)
+      · 16 m/s에서 0.5 m/s 오차 → **발전량 오차 거의 0** (정격 평탄부)
+    즉 상관없는 구간의 오차를 줄이느라 중요한 구간을 희생하고 있다.
+    05 3-b의 실측 근거: 이용률 50~70%(급경사)의 밴드 적중률이 0.226~0.247로 최악이고,
+    80~90%(평탄부)는 0.485로 최고다. **돈이 새는 곳이 정확히 급경사 구간이다.**
+
+    ⚠️ fold-safe: 파워커브를 `train_mask` 구간에서만 적합한다.
+    ⚠️ 04의 18-1('발전량 환산 오차 지표')과 헷갈리지 말 것 — 그건 **모델 선택 지표**로
+       썼다가 실패한 것이고 이건 **학습 손실의 가중**이다."""
+    ws, y = ctx.train[f"scada_ws_{g}"], ctx.train[g]
+    ok = train_mask & ws.notna() & y.notna()
+    edges, vals = fit_power_curve_oracle(ws[ok].to_numpy(dtype=float), y[ok].to_numpy(dtype=float))
+    v = ws.fillna(ws.median()).to_numpy(dtype=float)
+    slope = np.interp(v, edges, np.abs(np.gradient(vals, edges)))
+    power = np.interp(v, edges, vals) / CAPACITY_KWH[g]         # 0~1로 정규화
+    w = {"slope": slope, "pcslope": slope, "rev": power, "pcrev": slope * power}[mode]
+    w = np.clip(w / w[ok.to_numpy()].mean(), floor, None)       # 평균 1로 정규화 + 하한
+    return pd.Series(w, index=ctx.train.index)
+
+
+def fit_wind_gbdt(ctx, g, train_mask, objective="l2", n_estimators=3000, seed=SEED, extra=None,
+                  sample_weight=None):
     """SCADA 실측 풍속을 타깃으로 LightGBM을 학습한다.
     발전량 라벨이 없어도 SCADA만 있으면 학습에 쓸 수 있다.
     ⚠️ 17-2 결과에 따라 **무작위성 없이(결정적)** 쓴다 — 풍속을 평활하면 강풍 발전량이 눌린다."""
-    X = build_wind_input_frame(ctx, ctx.train, g)
+    X = build_wind_input_frame(ctx, ctx.train, g, extra)
     y = ctx.train[f"scada_ws_{g}"]
     fit_idx = train_mask & y.notna()
     cut = ctx.train.loc[fit_idx, "kst_dtm"].quantile(0.9)      # 뒤 10%는 early stopping용
     tr, es = fit_idx & (ctx.train["kst_dtm"] <= cut), fit_idx & (ctx.train["kst_dtm"] > cut)
     m = lgb.LGBMRegressor(objective=objective, random_state=seed, n_estimators=n_estimators,
                           verbosity=-1, importance_type="gain")
-    m.fit(X.loc[tr], y[tr], eval_set=[(X.loc[es], y[es])], eval_metric="rmse",
+    m.fit(X.loc[tr], y[tr], sample_weight=None if sample_weight is None else sample_weight[tr],
+          eval_set=[(X.loc[es], y[es])], eval_metric="rmse",
           callbacks=[lgb.early_stopping(100, verbose=False)])
     return m
 
 
-def wind_estimate(ctx, g, cv_suffix, train_mask, objective="l2"):
-    """그 fold의 학습 구간에서만 학습해 **전체 기간**의 추정 풍속을 돌려준다(fold-safe, 캐시됨)."""
-    key = ("wind", g, cv_suffix, objective)
+def wind_estimate(ctx, g, cv_suffix, train_mask, objective="l2", speedup=False, wweight=None):
+    """그 fold의 학습 구간에서만 학습해 **전체 기간**의 추정 풍속을 돌려준다(fold-safe, 캐시됨).
+    `speedup=True` → 지형 speed-up 피처 2개 추가 / `wweight="pcslope"` → |dP/dv| 표본가중.
+    둘 다 캐시 키에 들어가므로 변형끼리 섞이지 않는다."""
+    key = ("wind", g, cv_suffix, objective, speedup, wweight)
     if key not in ctx.cache:
-        m = fit_wind_gbdt(ctx, g, train_mask, objective)
-        X = build_wind_input_frame(ctx, ctx.train, g)
+        extra = wind_extra_for_fold(ctx, ctx.train, g, train_mask, speedup)
+        assert wweight in WWEIGHT_MODES, f"모르는 wweight: {wweight}"
+        sw = powercurve_slope_weight(ctx, g, train_mask, mode=wweight) if wweight else None
+        m = fit_wind_gbdt(ctx, g, train_mask, objective, extra=extra, sample_weight=sw)
+        X = build_wind_input_frame(ctx, ctx.train, g, extra)
         ctx.cache[key] = pd.Series(m.predict(X), index=ctx.train.index).clip(lower=0.0)
     return ctx.cache[key]
 
@@ -381,7 +489,18 @@ def wind_estimate(ctx, g, cv_suffix, train_mask, objective="l2"):
 def make_sample_weight(y, g, mode):
     """산식을 학습에 반영하는 표본 가중.
     'actual' = 실제발전량/설비용량 (하한 0.1) — FICR의 actual 가중을 모사한다.
-    하한을 두는 이유: 예측 시점엔 어떤 행이 채점 대상인지 모른다."""
+    하한을 두는 이유: 채점 대상 행을 통째로 버리면 그 피처 영역을 모델이 못 배운다
+    (예보가 틀려 '저풍속인 줄 알았는데 실제 발전량이 컸던' 행도 채점 대상이다).
+
+    ⚠️ 'actual'은 **산식의 절반만** 모사한다. 산식을 다시 보면
+
+        score = 0.5·(1 − NMAE) + 0.5·FICR
+                       └ 채점행 **균등**     └ 실제발전량 **가중**
+
+    NMAE는 채점 대상 행을 **똑같이** 세고, FICR만 발전량으로 가중한다.
+    그런데 'actual'은 전부 발전량 가중이라 **고출력 행에 과하게 쏠린다.**
+    'metric' 모드가 둘을 50:50으로 맞춘 것이다.
+    """
     if mode is None:
         return None
     ratio = np.asarray(y, dtype=float) / CAPACITY_KWH[g]
@@ -389,6 +508,8 @@ def make_sample_weight(y, g, mode):
         return np.where(ratio >= 0.10, 1.0, 0.1)
     if mode == "actual":
         return np.maximum(ratio, 0.1)
+    if mode == "metric":          # 0.5×균등(NMAE) + 0.5×발전량가중(FICR)
+        return np.where(ratio >= 0.10, 0.5 + 0.5 * ratio, 0.1)
     raise ValueError(mode)
 
 
@@ -440,6 +561,96 @@ def lgbm_train_label(ctx, X_full, g, train_mask, alpha=DEFAULT_TAU, seed=SEED,
     return m
 
 
+def gbdt_train_label(ctx, X_full, g, train_mask, family="lightgbm", alpha=DEFAULT_TAU, seed=SEED,
+                     mode=DEFAULT_LABEL_MODE, rand=False, n_estimators=2000,
+                     w2022=1.0, params_override=None, wmode="actual"):
+    """`lgbm_train_label`과 **완전히 같은 라벨·가중·조기종료 구조**로 다른 GBDT 패밀리도 학습한다.
+
+    왜 패밀리를 섞는가: 서로 다른 구현은 오차가 **다른 방향으로** 틀린다. 상관이 1보다 낮으면
+    평균이 반드시 분산(σ)을 줄이고, 05 3절에서 확인했듯 **FICR은 σ에 가파르게 반응**한다
+    (오차 5% 감소 → Total +0.013).
+    ⚠️ 이것은 **파이프라인 마지막 단(발전량 예측)** 의 앙상블이므로 04의 17절 교훈
+    ("풍속은 평균 내지 말 것 — Jensen 부등식")에 저촉되지 않는다.
+
+    τ=0.50이면 분위수 손실 = MAE라 세 패밀리의 목적함수가 수학적으로 동일해진다."""
+    train = ctx.train
+    fit_idx = train_mask & train[g].notna()
+    cut = train.loc[fit_idx, "kst_dtm"].quantile(0.9)
+    idx_tr = train.index[fit_idx & (train["kst_dtm"] <= cut)]
+    idx_es = train.index[fit_idx & (train["kst_dtm"] > cut)]
+
+    def prep(idx):
+        y_mod, mul, keep = make_label_arrays(ctx, g, idx, mode)
+        w = make_sample_weight(train.loc[idx, g], g, wmode)
+        if mul is not None:
+            w = w * np.asarray(mul, dtype=float)
+        if w2022 != 1.0:
+            # 2022년은 group_1 정지율이 0.54~0.62(2023~24는 0.02~0.17)로 라벨 품질이 의심된다.
+            # 통째로 빼면 표본이 크게 줄므로(fold1은 6개월만 남는다) **가중만 낮춘다.**
+            old = train.loc[idx, "kst_dtm"] < pd.Timestamp("2023-01-01")
+            w = w * np.where(old.to_numpy(), w2022, 1.0)
+        k = keep.to_numpy()
+        return X_full.loc[idx][k], y_mod[k], w[k]
+
+    Xtr, ytr, wtr = prep(idx_tr)
+    Xes, yes, wes = prep(idx_es)
+    assert len(Xtr) > 100 and len(Xes) > 20, f"{g}/{mode}: 학습 표본이 너무 적음"
+
+    if family == "lightgbm":
+        params = dict(objective="quantile", alpha=alpha, random_state=seed,
+                      n_estimators=n_estimators, verbosity=-1, importance_type="gain")
+        if rand:
+            params.update(RAND_PARAMS)
+        params.update(params_override or {})
+        m = lgb.LGBMRegressor(**params)
+        m.fit(Xtr, ytr, sample_weight=wtr, eval_set=[(Xes, yes)], eval_sample_weight=[wes],
+              eval_metric="l1", callbacks=[lgb.early_stopping(50, verbose=False)])
+        return m
+
+    if family == "xgboost":
+        import xgboost as xgb
+        params = dict(objective="reg:quantileerror", quantile_alpha=alpha, random_state=seed,
+                      n_estimators=n_estimators, early_stopping_rounds=50, verbosity=0)
+        if rand:
+            params.update(subsample=0.8, colsample_bytree=0.8)
+        params.update(params_override or {})
+        m = xgb.XGBRegressor(**params)
+        m.fit(Xtr, ytr, sample_weight=wtr, eval_set=[(Xes, yes)],
+              sample_weight_eval_set=[wes], verbose=False)
+        return m
+
+    if family == "catboost":
+        from catboost import CatBoostRegressor
+        params = dict(loss_function=f"Quantile:alpha={alpha}", random_seed=seed,
+                      n_estimators=n_estimators, early_stopping_rounds=50, verbose=False,
+                      allow_writing_files=False)
+        if rand:
+            params.update(subsample=0.8, rsm=0.8, bootstrap_type="Bernoulli")
+        params.update(params_override or {})
+        m = CatBoostRegressor(**params)
+        m.fit(Xtr, ytr, sample_weight=wtr, eval_set=(Xes, yes))
+        return m
+
+    raise ValueError(f"모르는 family: {family}")
+
+
+def gbdt_fold_fit_fn(family="lightgbm", mode=DEFAULT_LABEL_MODE, tau=DEFAULT_TAU, seed=SEED,
+                     top_n=BEST_TOPN, speedup=False, wweight=None, rand=False,
+                     w2022=1.0, params_override=None, wmode="actual"):
+    """run_variant에 넘길 fit_fn 생성기 — 패밀리만 바꿔 공정 비교한다.
+
+    ⚠️ `keep`(피처 200개)은 **패밀리와 무관하게 LightGBM 기준선에서 고른 것**을 쓴다.
+    피처 집합까지 바꾸면 무엇이 차이를 만들었는지 분리되지 않는다."""
+    def fit_fn(ctx, g, cv_suffix, train_mask, valid_idx):
+        X = frame_for_fold(ctx, g, cv_suffix, train_mask, speedup=speedup, wweight=wweight)
+        keep = keep_for_fold(ctx, g, cv_suffix, train_mask, top_n)
+        m = gbdt_train_label(ctx, X[keep], g, train_mask, family, tau, seed, mode, rand,
+                             w2022=w2022, params_override=params_override, wmode=wmode)
+        p = pd.Series(m.predict(X.loc[valid_idx, keep]), index=valid_idx)
+        return p.clip(lower=0, upper=CAPACITY_KWH[g])
+    return fit_fn
+
+
 def select_features(model, columns, top_n=BEST_TOPN):
     """gain 중요도 상위 top_n개. top_n=None이면 gain>0인 것 전부."""
     imp = pd.Series(model.feature_importances_, index=model.feature_name_, dtype=float)
@@ -450,14 +661,15 @@ def select_features(model, columns, top_n=BEST_TOPN):
 # ---------------------------------------------------------------------------
 # fold 실험 harness
 # ---------------------------------------------------------------------------
-def frame_for_fold(ctx, g, cv_suffix, train_mask=None, pc_norm=False):
-    """검증용 피처 프레임 (GBDT 풍속 기반, 캐시됨)."""
-    key = ("frame", g, cv_suffix, pc_norm)
+def frame_for_fold(ctx, g, cv_suffix, train_mask=None, pc_norm=False, speedup=False, wweight=None):
+    """검증용 피처 프레임 (GBDT 풍속 기반, 캐시됨).
+    `speedup` / `wweight`는 1단계 풍속 모델의 변형을 고른다 (기본값이면 기존 동작과 동일)."""
+    key = ("frame", g, cv_suffix, pc_norm, speedup, wweight)
     if key not in ctx.cache:
         if train_mask is None:
             train_mask = next(v["train_mask"] for v in ctx.fold_info.values()
                               if v["cv_suffix"] == cv_suffix)
-        ws = wind_estimate(ctx, g, cv_suffix, train_mask)
+        ws = wind_estimate(ctx, g, cv_suffix, train_mask, speedup=speedup, wweight=wweight)
         pc_target = None
         if pc_norm:
             a = ctx.avail[g].fillna(AVAIL_NAN_FILL).clip(0.0, 1.0)
@@ -504,11 +716,10 @@ def run_variant(ctx, pred_cache, variant, fit_fn, verbose=True):
 def summarize(result_dfs):
     """A안 / B안 3fold / B안 평균·표준편차 표.
 
-    ⚠️ 지표 선택 규칙 (v5 리더보드가 알려준 것):
-      · LightGBM 계열(피처·하이퍼파라미터) → **B안 평균**을 주 지표로
-      · 신경망 계열(블렌드 비중·구조)     → **A안**을 주 지표로
-        B안은 학습 구간이 1.5~3년이라 데이터 민감 모델을 과소평가하는데,
-        최종 모델은 3년 전체를 쓴다.
+    ⚠️ 주 지표는 **B안 평균**이다 (모델 종류와 무관하게).
+      한때 "신경망 계열은 A안" 규칙을 썼으나 v6/v7 리더보드로 반증됐다(2026-08-03 폐기).
+      MLP 블렌드 비중에서 A안은 0.8을 최고로 꼽았지만 실제 최고는 0.5였고, B평균이 맞혔다.
+      A안은 방향 일치 확인용 보조 지표로만 본다.
     """
     df = pd.concat(result_dfs, ignore_index=True)
     p = df.pivot(index="model", columns="fold", values="score")
@@ -603,10 +814,15 @@ def blend_score(ctx, pred_cache, var_a, var_b, w):
     return d["score"]["A안(2024)"], d["score"][B_FOLDS].mean(), d["score"][B_FOLDS].min(), d
 
 
-def lgbm_fold_fit_fn(mode=DEFAULT_LABEL_MODE, tau=DEFAULT_TAU, seed=SEED, top_n=BEST_TOPN):
-    """run_variant에 넘길 LightGBM fit_fn 생성기."""
+def lgbm_fold_fit_fn(mode=DEFAULT_LABEL_MODE, tau=DEFAULT_TAU, seed=SEED, top_n=BEST_TOPN,
+                     speedup=False, wweight=None):
+    """run_variant에 넘길 LightGBM fit_fn 생성기.
+
+    ⚠️ `keep`(피처 200개)은 **speedup 여부와 무관하게 기준선 프레임에서 고른 것**을 쓴다.
+    speed-up은 컬럼 이름을 바꾸지 않고 `ws_gbdtl2`의 **값만** 바꾸므로, 같은 피처 집합으로
+    비교해야 '풍속이 좋아졌는가' 하나만 달라지는 통제된 비교가 된다."""
     def fit_fn(ctx, g, cv_suffix, train_mask, valid_idx):
-        X = frame_for_fold(ctx, g, cv_suffix, train_mask)
+        X = frame_for_fold(ctx, g, cv_suffix, train_mask, speedup=speedup, wweight=wweight)
         keep = keep_for_fold(ctx, g, cv_suffix, train_mask, top_n)
         m = lgbm_train_label(ctx, X[keep], g, train_mask, tau, seed, mode)
         p = pd.Series(m.predict(X.loc[valid_idx, keep]), index=valid_idx)
